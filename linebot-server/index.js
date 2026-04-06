@@ -2,26 +2,83 @@ require('dotenv').config();
 const express = require('express');
 const crypto = require('crypto');
 const axios = require('axios');
+const cron = require('node-cron');
 
 const app = express();
 
 const CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
 const CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 
-// 環境変数で固定登録できる（カンマ区切りで複数指定可）
+// 環境変数で固定登録（カンマ区切りで複数指定可）
 // 例: FIXED_GROUP_IDS=Cxxx,Cyyy
 const fixedGroupIds = (process.env.FIXED_GROUP_IDS || '')
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean);
 
-// メモリ上に保持（再デプロイでリセットされるが webhookで再登録される）
+// メモリ上の連絡先
 const contacts = {
   groups: fixedGroupIds.map((id) => ({ groupId: id, groupName: id })),
   users: [],
 };
 
-// LINE webhook のシグネチャ検証
+// 送信済みtodoリスト（宛先IDをキーに蓄積）
+// { [destinationId]: [{ title, dueDate, sentAt }] }
+const pendingTodos = {};
+
+function addPendingTodo(to, title, dueDate) {
+  if (!pendingTodos[to]) pendingTodos[to] = [];
+  pendingTodos[to].push({ title, dueDate, sentAt: new Date().toISOString() });
+}
+
+// ── 毎朝9時（日本時間）にリマインド送信 ────────────────────
+// node-cron はシステム時刻を使うため、Renderの TZ 環境変数を Asia/Tokyo に設定すること
+cron.schedule('0 9 * * *', async () => {
+  console.log('[Cron] 朝9時のリマインド送信開始');
+
+  const allDestinations = [
+    ...contacts.groups.map((g) => g.groupId),
+    ...contacts.users.map((u) => u.userId),
+  ];
+
+  for (const dest of allDestinations) {
+    const todos = pendingTodos[dest];
+    if (!todos || todos.length === 0) continue;
+
+    const lines = todos.map((t, i) => {
+      const dateText = t.dueDate ? ` 📅${t.dueDate}` : '';
+      return `${i + 1}. ${t.title}${dateText}`;
+    });
+
+    const text = `☀️ 今日のtodoリスト（${todos.length}件）\n\n${lines.join('\n')}`;
+
+    try {
+      await pushMessage(dest, text);
+      console.log(`[Cron] 送信完了: ${dest}`);
+      pendingTodos[dest] = []; // 送信後リセット
+    } catch (e) {
+      console.error(`[Cron] 送信失敗: ${dest}`, e.message);
+    }
+  }
+}, {
+  timezone: 'Asia/Tokyo',
+});
+
+// ── LINE Messaging API ─────────────────────────────────────
+async function pushMessage(to, text) {
+  await axios.post(
+    'https://api.line.me/v2/bot/message/push',
+    { to, messages: [{ type: 'text', text }] },
+    {
+      headers: {
+        Authorization: `Bearer ${CHANNEL_ACCESS_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+    }
+  );
+}
+
+// ── Webhook シグネチャ検証 ─────────────────────────────────
 function verifySignature(rawBody, signature) {
   const hash = crypto
     .createHmac('sha256', CHANNEL_SECRET)
@@ -30,7 +87,6 @@ function verifySignature(rawBody, signature) {
   return hash === signature;
 }
 
-// rawBody を保持しながら JSON パース
 app.use(
   express.json({
     verify: (req, _res, buf) => {
@@ -84,12 +140,12 @@ app.post('/webhook', async (req, res) => {
   res.status(200).send('OK');
 });
 
-// ── グループ・ユーザー一覧 ──────────────────────────────────
+// ── 連絡先一覧 ─────────────────────────────────────────────
 app.get('/contacts', (_req, res) => {
   res.json(contacts);
 });
 
-// ── todo をLINEに送信 ─────────────────────────────────────
+// ── todo送信 ───────────────────────────────────────────────
 app.post('/send', async (req, res) => {
   const { to, title, dueDate } = req.body;
 
@@ -101,19 +157,9 @@ app.post('/send', async (req, res) => {
   const text = `📌 ${title}${dateText}`;
 
   try {
-    await axios.post(
-      'https://api.line.me/v2/bot/message/push',
-      {
-        to,
-        messages: [{ type: 'text', text }],
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${CHANNEL_ACCESS_TOKEN}`,
-          'Content-Type': 'application/json',
-        },
-      }
-    );
+    await pushMessage(to, text);
+    // 朝のリマインドリストにも追加
+    addPendingTodo(to, title, dueDate || null);
     res.json({ success: true });
   } catch (error) {
     const detail = error.response?.data || error.message;
