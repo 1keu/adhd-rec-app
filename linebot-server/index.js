@@ -2,32 +2,24 @@ require('dotenv').config();
 const express = require('express');
 const crypto = require('crypto');
 const axios = require('axios');
-const fs = require('fs');
-const path = require('path');
 
 const app = express();
 
 const CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
 const CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
-const DATA_FILE = path.join(__dirname, 'data', 'contacts.json');
 
-// data/ ディレクトリがなければ作成
-if (!fs.existsSync(path.dirname(DATA_FILE))) {
-  fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
-}
+// 環境変数で固定登録できる（カンマ区切りで複数指定可）
+// 例: FIXED_GROUP_IDS=Cxxx,Cyyy
+const fixedGroupIds = (process.env.FIXED_GROUP_IDS || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
 
-// 連絡先データ（グループ・ユーザー）を読み書き
-function loadContacts() {
-  try {
-    return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-  } catch {
-    return { groups: [], users: [] };
-  }
-}
-
-function saveContacts(data) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
-}
+// メモリ上に保持（再デプロイでリセットされるが webhookで再登録される）
+const contacts = {
+  groups: fixedGroupIds.map((id) => ({ groupId: id, groupName: id })),
+  users: [],
+};
 
 // LINE webhook のシグネチャ検証
 function verifySignature(rawBody, signature) {
@@ -60,40 +52,32 @@ app.post('/webhook', async (req, res) => {
   }
 
   const events = req.body.events || [];
-  const contacts = loadContacts();
 
   for (const event of events) {
     const source = event.source;
 
     if (event.type === 'join' && source.type === 'group') {
-      // ボットがグループに追加された
       const groupId = source.groupId;
       if (!contacts.groups.find((g) => g.groupId === groupId)) {
         const groupName = await fetchGroupName(groupId);
         contacts.groups.push({ groupId, groupName });
         console.log(`Group joined: ${groupName} (${groupId})`);
-        saveContacts(contacts);
       }
     } else if (event.type === 'leave' && source.type === 'group') {
-      // ボットがグループから退出した
       contacts.groups = contacts.groups.filter(
         (g) => g.groupId !== source.groupId
       );
-      saveContacts(contacts);
     } else if (event.type === 'follow') {
-      // ユーザーが友達追加した
       const userId = source.userId;
       if (!contacts.users.find((u) => u.userId === userId)) {
         const displayName = await fetchUserName(userId);
         contacts.users.push({ userId, displayName });
         console.log(`User followed: ${displayName} (${userId})`);
-        saveContacts(contacts);
       }
     } else if (event.type === 'unfollow') {
       contacts.users = contacts.users.filter(
         (u) => u.userId !== source.userId
       );
-      saveContacts(contacts);
     }
   }
 
@@ -102,7 +86,6 @@ app.post('/webhook', async (req, res) => {
 
 // ── グループ・ユーザー一覧 ──────────────────────────────────
 app.get('/contacts', (_req, res) => {
-  const contacts = loadContacts();
   res.json(contacts);
 });
 
