@@ -47,11 +47,14 @@ app.use(
   })
 );
 
+// 疎通確認用
+app.get('/', (_req, res) => res.send('LINE bot server is running'));
+
 // ── Webhook ────────────────────────────────────────────────
 app.post('/webhook', async (req, res) => {
   const signature = req.headers['x-line-signature'];
 
-  if (!verifySignature(req.rawBody, signature)) {
+  if (CHANNEL_SECRET && !verifySignature(req.rawBody, signature)) {
     console.error('Invalid signature');
     return res.status(400).send('Invalid signature');
   }
